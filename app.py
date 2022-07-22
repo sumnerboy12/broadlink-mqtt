@@ -14,14 +14,18 @@ import binascii
 # get the data directory
 DATA_DIR = os.getenv('DATA_DIR', os.path.dirname(os.path.abspath(__file__)))
 
+# logging config
+LOG_LEVEL = os.getenv('LOG_LEVEL', 'DEBUG')
+LOG_FORMAT = os.getenv('LOG_FORMAT', '%(asctime)-15s %(levelname)-5s [%(module)s] %(message)s')
+
 # read initial config files
-LOGGING_CONF = os.path.join(DATA_DIR, 'logging.conf')
 APP_CONFIG = os.path.join(DATA_DIR, 'app.conf')
 
 class Config(object):
     def __init__(self, filename):
         self.config = {}
-        exec(compile(open(filename, "rb").read(), filename, 'exec'), self.config)
+        if os.path.exists(filename):
+            exec(compile(open(filename, "rb").read(), filename, 'exec'), self.config)
 
     def get(self, key, default='MISSING_CONFIG'):
         # env var has precendence
@@ -35,7 +39,7 @@ class Config(object):
         return value
 
 # initialise logging as early as possible
-logging.config.fileConfig(LOGGING_CONF)
+logging.basicConfig(stream=sys.stderr, level=LOG_LEVEL, format=LOG_FORMAT)
 
 # load application config
 try:
@@ -59,45 +63,49 @@ def on_message(client, devices, msg):
             device = devices[host]
 
     if not device:
-        logging.warning('No device found for payload: %s' % msg.payload)
+        logging.warning('No device found for message: %s' % (msg.payload))
         return
-
-    logging.debug('Message received for %s device at %s (MAC %s)' % (device.type, device.host[0], ':'.join(format(s, '02x') for s in device.mac)))
 
     if 'command' in payload:
         command = payload.get('command')
         action = payload.get('action', '')
 
+        logging.debug('Command received for %s device at %s (MAC %s): %s -> %s' % (device.type, device.host[0], ':'.join(format(s, '02x') for s in device.mac), command, action))
+
         if device.type in ['RM2', 'RM4', 'RM4PRO', 'RMMINI', 'RM4MINI', 'RMMINIB', 'RMPRO']:
             file = os.path.join(DATA_DIR, 'commands', command)
             handy_file = os.path.join(file, action)
 
-            if command == 'macro':
-                file = os.path.join(DATA_DIR, 'macros', action)
-                macro(device, file)
-            elif action == '' or action == 'auto':
-                record_or_replay(device, file)
-            elif action == 'autorf':
-                record_or_replay_rf(device, file)
-            elif os.path.isfile(handy_file):
-                replay(device, handy_file)
-            elif action == 'record':
-                record(device, file)
-            elif action == 'recordrf':
-                record_rf(device, file)
-            elif action == 'replay':
-                replay(device, file)
-            elif action == 'macro':
-                file = os.path.join(DATA_DIR, 'macros', command)
-                macro(device, file)
-            else:
-                logging.warning("Unrecognized MQTT message " + action)
+            try:
+                if command == 'macro':
+                    file = os.path.join(DATA_DIR, 'macros', action)
+                    macro(device, file)
+                elif action == '' or action == 'auto':
+                    record_or_replay(device, file)
+                elif action == 'autorf':
+                    record_or_replay_rf(device, file)
+                elif os.path.isfile(handy_file):
+                    replay(device, handy_file)
+                elif action == 'record':
+                    record(device, file)
+                elif action == 'recordrf':
+                    record_rf(device, file)
+                elif action == 'replay':
+                    replay(device, file)
+                elif action == 'macro':
+                    file = os.path.join(DATA_DIR, 'macros', command)
+                    macro(device, file)
+                else:
+                    logging.warning('Unrecognized MQTT message: %s' % (msg.payload))
 
+            except Exception as e:
+                logging.error('Error handling command %s: %s' % (command, e))
+                return
 
 # noinspection PyUnusedLocal
 def on_connect(client, devices, flags, result_code):
     if result_code == 0:
-        logging.debug("MQTT connected")
+        logging.info("MQTT connected")
 
         birth_topic = cf.get('mqtt_birth_topic', 'stat/broadlink/lwt')
         birth_payload = payload=cf.get('mqtt_birth_payload', '{"online":true}')
@@ -250,13 +258,17 @@ def configure_device(device):
 
 
 if __name__ == '__main__':
+    logging.info("Scanning for Broadlink devices...")
     devices = get_devices(cf)
 
     if len(devices) == 0:
         logging.warning('No devices found, exiting')
         sys.exit(2)
 
+    broker = cf.get('mqtt_broker', 'localhost')
+    port  = int(cf.get('mqtt_port', 1883))
     clientid = cf.get('mqtt_clientid', 'broadlink')
+
     mqttc = paho.Client(clientid, clean_session=False, userdata=devices)
 
     mqttc.on_message = on_message
@@ -271,8 +283,9 @@ if __name__ == '__main__':
         mqttc.username_pw_set(cf.get('mqtt_username'), cf.get('mqtt_password'))
 
     while True:
+        logging.info('Attempting to connect to MQTT broker at %s:%d...' % (broker, port))
         try:
-            mqttc.connect(cf.get('mqtt_broker', 'localhost'), cf.get('mqtt_port', 1883), 60)
+            mqttc.connect(broker, port, 60)
             mqttc.loop_forever()
         except socket.error:
             logging.warning("Failed to connect to MQTT broker, will try to reconnect in 5 seconds")
